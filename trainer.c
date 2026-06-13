@@ -16,12 +16,17 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <psapi.h>
 
 /* ── Offsets ───────────────────────────────────────────────────────────── */
 #define STRUCT_PTR    0x4E0660 /* [module+this] 64-bit -> character struct      */
+/* STRUCT_PTR is the only module-level offset — it shifts on game updates. It is
+ * auto-located at startup by AOB scan (resolve_struct_ptr); the #define above is
+ * the fallback if the scan fails. The struct-internal offsets below are stable
+ * across updates and stay hardcoded. */
 #define YEL_OFFSET    0x0D58   /* yellow stamina remaining  (max ~0.25)         */
 #define YEL_OFFSET2   0x0D54   /* yellow stamina copy                           */
 #define YEL_OFFSET3   0x0D40   /* yellow stamina copy — combat/knockout value   */
@@ -144,10 +149,92 @@ static void wpm4f(HANDLE proc, uintptr_t addr, float val)
     VirtualProtectEx(proc, (LPVOID)addr, 4, old, &old);
 }
 
+/* Module-relative offset of the struct pointer. Defaults to the hardcoded
+ * value; replaced at startup by the AOB scan if it succeeds. */
+static uintptr_t g_struct_ptr = STRUCT_PTR;
+
+/*
+ * AOB (array-of-bytes) signature scan over the module's executable image.
+ * mask: 'x' = byte must match pat, '?' = wildcard. Returns the VA of the first
+ * match, or 0. Lets us locate code by its (stable) opcodes instead of hardcoding
+ * data addresses that move every game update.
+ */
+static uintptr_t aob_scan(HANDLE proc, uintptr_t base,
+                          const uint8_t *pat, const char *mask, size_t len)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *buf = NULL; size_t cap = 0;
+    uintptr_t addr = base, found = 0;
+
+    while (!found && VirtualQueryEx(proc, (LPCVOID)addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+            (uintptr_t)mbi.AllocationBase == base &&
+            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+            if (mbi.RegionSize > cap) {
+                free(buf); buf = (uint8_t *)malloc(mbi.RegionSize);
+                cap = buf ? mbi.RegionSize : 0;
+            }
+            SIZE_T n;
+            if (buf && ReadProcessMemory(proc, mbi.BaseAddress, buf, mbi.RegionSize, &n)) {
+                for (size_t i = 0; i + len <= n; i++) {
+                    size_t j = 0;
+                    while (j < len && (mask[j] == '?' || buf[i + j] == pat[j])) j++;
+                    if (j == len) { found = (uintptr_t)mbi.BaseAddress + i; break; }
+                }
+            }
+        }
+        uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+    }
+    free(buf);
+    return found;
+}
+
+/*
+ * Resolve the RIP-relative target of an instruction located by an AOB match.
+ *   sig_at    - address the signature matched
+ *   instr_off - offset of the target instruction within the signature
+ *   instr_len - full length of that instruction
+ *   disp_off  - offset of the rel32 displacement within the instruction
+ * Returns the absolute target VA, or 0 on read failure. (x64 RIP-relative: the
+ * displacement is signed and relative to the address of the NEXT instruction.)
+ */
+static uintptr_t rip_target(HANDLE proc, uintptr_t sig_at,
+                            size_t instr_off, size_t instr_len, size_t disp_off)
+{
+    uintptr_t instr = sig_at + instr_off;
+    int32_t disp; SIZE_T n;
+    if (!ReadProcessMemory(proc, (LPCVOID)(instr + disp_off), &disp, 4, &n) || n != 4)
+        return 0;
+    return instr + instr_len + (intptr_t)disp;
+}
+
+/*
+ * Locate the struct-pointer load and read its RIP-relative displacement to
+ * compute STRUCT_PTR for the running build. Anchor:
+ *   48 8B 05 ?? ?? ?? ??   mov rax,[rip+disp]   ; loads the struct pointer
+ *   8B 80 58 0D 00 00      mov eax,[rax+0xD58]  ; yellow offset (makes it unique)
+ * Returns the module-relative offset, or 0 if not found.
+ */
+static uintptr_t resolve_struct_ptr(HANDLE proc, uintptr_t base)
+{
+    static const uint8_t pat[]  = {0x48,0x8B,0x05,0,0,0,0,0x8B,0x80,0x58,0x0D,0x00,0x00};
+    static const char    mask[] = "xxx????xxxxxx";
+    uintptr_t at = aob_scan(proc, base, pat, mask, sizeof(pat));
+    if (!at) return 0;
+
+    /* the mov rax,[rip+disp] is at the start of the match: 7 bytes, rel32 @ +3 */
+    uintptr_t target = rip_target(proc, at, 0, 7, 3);
+    if (!target) return 0;
+    return target - base;                         /* module-relative offset */
+}
+
 static uintptr_t get_struct(HANDLE proc, uintptr_t base)
 {
     uint64_t ptr = 0;
-    if (!rpm8(proc, base + STRUCT_PTR, &ptr) || !ptr) return 0;
+    if (!rpm8(proc, base + g_struct_ptr, &ptr) || !ptr) return 0;
     return (uintptr_t)ptr;
 }
 
@@ -213,7 +300,19 @@ int main(void)
         printf("Press Enter to exit...\n"); getchar();
         return 1;
     }
-    printf("Found! Module base: 0x%llX\n\n", (unsigned long long)base);
+    printf("Found! Module base: 0x%llX\n", (unsigned long long)base);
+
+    /* Auto-locate the struct pointer so the trainer survives game updates that
+     * shift the static offset. Falls back to the hardcoded value. */
+    uintptr_t aob = resolve_struct_ptr(proc, base);
+    if (aob) {
+        g_struct_ptr = aob;
+        printf("Struct pointer located via AOB: module+0x%llX\n\n",
+               (unsigned long long)g_struct_ptr);
+    } else {
+        printf("AOB scan failed — using built-in offset 0x%X "
+               "(may be wrong after a game update)\n\n", STRUCT_PTR);
+    }
 
     uintptr_t hs = get_struct(proc, base);
     if (!hs) {
