@@ -85,18 +85,19 @@ static const char *SPEED_LABELS[] = {
 /*
  * Red is additive (units/sec) since it has no natural regen to multiply.
  */
-static const float RED_RATES[] = { 0.0f, 0.25f/120, 0.25f/60, 0.25f/30, 0.25f/10, 0.25f/5, LOCK };
+static const float RED_RATES[] = { 0.0f, 0.25f/600, 0.25f/120, 0.25f/60, 0.25f/30, 0.25f/10, 0.25f/5, LOCK };
 
 static const char *RED_LABELS[] = {
     "Off",
-    "Very slow (~120s to full)",
+    "Trickle   (~10m to full)",
+    "Very slow (~2m to full)",
     "Slow      (~60s to full)",
     "Medium    (~30s to full)",
     "Fast      (~10s to full)",
     "Fastest   (~5s to full)",
     "Lock to max (demigod mode)"
 };
-#define N_RED 7
+#define N_RED 8
 
 /* ── Process helpers ───────────────────────────────────────────────────── */
 
