@@ -22,17 +22,18 @@
 #include <psapi.h>
 
 /* ── Offsets ───────────────────────────────────────────────────────────── */
-#define STRUCT_PTR    0x4E0660 /* [module+this] 64-bit -> character struct      */
+#define STRUCT_PTR    0x4EC7A0 /* [module+this] 64-bit -> character struct      */
 /* STRUCT_PTR is the only module-level offset — it shifts on game updates. It is
  * auto-located at startup by AOB scan (resolve_struct_ptr); the #define above is
- * the fallback if the scan fails. The struct-internal offsets below are stable
- * across updates and stay hardcoded. */
-#define YEL_OFFSET    0x0D58   /* yellow stamina remaining  (max ~0.25)         */
-#define YEL_OFFSET2   0x0D54   /* yellow stamina copy                           */
-#define YEL_OFFSET3   0x0D40   /* yellow stamina copy — combat/knockout value   */
-#define RED_OFFSET    0x0D44   /* red health remaining (0.25=healthy, 0.0=dead) */
-#define BLU_CURRENT   0x0D5C   /* blue focus current (drained by active spells) */
-#define BLU_CAP       0x0D60   /* blue bar max capacity (binding spells reduce)  */
+ * the fallback if the scan fails. The struct-internal offsets below shifted by
+ * a uniform +8 as of the 0.9.5.2 update that broke the old 0x0D58-anchored scan; verified
+ * via the "mov eax,[rax+0xD60]" / "mov eax,[rax+0xD64]" (yellow/blue) read pair. */
+#define YEL_OFFSET    0x0D60   /* yellow stamina remaining  (max ~0.25)         */
+#define YEL_OFFSET2   0x0D5C   /* yellow stamina copy                           */
+#define YEL_OFFSET3   0x0D48   /* yellow stamina copy — combat/knockout value   */
+#define RED_OFFSET    0x0D4C   /* red health remaining (0.25=healthy, 0.0=dead) */
+#define BLU_CURRENT   0x0D64   /* blue focus current (drained by active spells) */
+#define BLU_CAP       0x0D68   /* blue bar max capacity (binding spells reduce)  */
 
 #define YEL_MAX   0.25f
 #define RED_MAX   0.25f
@@ -47,7 +48,7 @@
  * menu. We watch a block of live ragdoll physics (positions/velocities that
  * always micro-jitter while the sim runs); static for HB_STALE_MS => paused.
  */
-#define HB_OFFSET   0x0C30
+#define HB_OFFSET   0x0C38
 #define HB_LEN      0x40
 #define HB_STALE_MS 250
 
@@ -216,12 +217,12 @@ static uintptr_t rip_target(HANDLE proc, uintptr_t sig_at,
  * Locate the struct-pointer load and read its RIP-relative displacement to
  * compute STRUCT_PTR for the running build. Anchor:
  *   48 8B 05 ?? ?? ?? ??   mov rax,[rip+disp]   ; loads the struct pointer
- *   8B 80 58 0D 00 00      mov eax,[rax+0xD58]  ; yellow offset (makes it unique)
+ *   8B 80 60 0D 00 00      mov eax,[rax+0xD60]  ; yellow offset (makes it unique)
  * Returns the module-relative offset, or 0 if not found.
  */
 static uintptr_t resolve_struct_ptr(HANDLE proc, uintptr_t base)
 {
-    static const uint8_t pat[]  = {0x48,0x8B,0x05,0,0,0,0,0x8B,0x80,0x58,0x0D,0x00,0x00};
+    static const uint8_t pat[]  = {0x48,0x8B,0x05,0,0,0,0,0x8B,0x80,0x60,0x0D,0x00,0x00};
     static const char    mask[] = "xxx????xxxxxx";
     uintptr_t at = aob_scan(proc, base, pat, mask, sizeof(pat));
     if (!at) return 0;
