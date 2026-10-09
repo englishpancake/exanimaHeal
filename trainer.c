@@ -9,10 +9,10 @@
 #include <windows.h>
 #include <psapi.h>
 
-/* The scan finds the player pointer and a yellow stamina field. The other fields
- * come from a known layout. Zero means we have not confirmed that field. */
+/* The scan finds the player pointer and a yellow stamina field. Other fields
+ * come from a known layout or the same spacing after a uniform shift. */
 typedef struct {
-    uint32_t yellow_read, yellow, yellow_copy, yellow_combat;
+    uint32_t yellow_read, yellow, yellow_copy, yellow_copy2, yellow_combat;
     uint32_t red, blue, blue_cap, health_max, heartbeat;
     const char *name;
 } Layout;
@@ -22,12 +22,16 @@ static const Layout layouts[] = {
      .yellow_combat = 0xE68, .red = 0xE6C, .blue = 0xE84,
      .blue_cap = 0xE88, .heartbeat = 0xD58,
      .name = "0.9.5.2c (verified 2026-09-19)"},
-    {.yellow_read = 0xD70, .yellow = 0xD58, .red = 0xD5C,
+    {.yellow_read = 0xD70, .yellow = 0xD58, .yellow_copy = 0xD70,
+     .yellow_copy2 = 0xD6C,
+     .yellow_combat = 0xD58, .red = 0xD5C,
      .blue = 0xD74, .blue_cap = 0xD78, .health_max = 0x103C,
      .heartbeat = 0xC48,
      .name = "reported D58/D74 layout"}
 };
+static Layout g_selected_layout;
 static const Layout *g_layout;
+static int g_auto_shifted;
 
 #define YEL_MAX   0.25f
 #define RED_MAX   0.25f
@@ -60,12 +64,12 @@ static const float RED_RATES[] = { 0.0f, 0.25f/600, 0.25f/120, 0.25f/60, 0.25f/3
 
 static const char *RED_LABELS[] = {
     "Off",
-    "Trickle   (~10m to full)",
-    "Very slow (~2m to full)",
-    "Slow      (~60s to full)",
-    "Medium    (~30s to full)",
-    "Fast      (~10s to full)",
-    "Fastest   (~5s to full)",
+    "Trickle   (~10m from empty)",
+    "Very slow (~2m from empty)",
+    "Slow      (~60s from empty)",
+    "Medium    (~30s from empty)",
+    "Fast      (~10s from empty)",
+    "Fastest   (~5s from empty)",
     "Lock to max (demigod mode)"
 };
 #define N_RED 8
@@ -154,6 +158,14 @@ static int valid_layout(HANDLE proc, uintptr_t player, const Layout *layout)
         !isfinite(b) || b < 0.0f || b > 1.05f ||
         !isfinite(cap) || cap < 0.0f || cap > 1.05f || b > cap + 0.05f)
         return 0;
+    if (layout->yellow_copy) {
+        if (!rpm4f(proc, player + layout->yellow_copy, &max) ||
+            !isfinite(max) || max < 0.0f || max > 0.30f) return 0;
+    }
+    if (layout->yellow_copy2) {
+        if (!rpm4f(proc, player + layout->yellow_copy2, &max) ||
+            !isfinite(max) || max < 0.0f || max > 0.30f) return 0;
+    }
     if (layout->health_max) {
         if (!rpm4f(proc, player + layout->health_max, &max) ||
             !isfinite(max) || max < 0.20f || max > 0.30f) return 0;
@@ -165,18 +177,61 @@ static int valid_layout(HANDLE proc, uintptr_t player, const Layout *layout)
     return 1;
 }
 
-/* Check one matching instruction against the known layouts. */
+/* If the whole block moved, all these fields keep the same spacing. */
+static int shifted_layout(uint32_t field, uint32_t reference, Layout *layout)
+{
+    int64_t delta = (int64_t)field - reference;
+    if (delta < -0x2000 || delta > 0x2000 || delta % 4) return 0;
+    if ((int64_t)layouts[1].heartbeat + delta < 0 ||
+        (int64_t)layouts[1].yellow + delta < 4 ||
+        (int64_t)layouts[1].yellow_read + delta < 0x128 ||
+        (int64_t)layouts[1].health_max + delta >= 0x4000) return 0;
+
+    *layout = layouts[1];
+    layout->yellow_read = (uint32_t)((int64_t)layout->yellow_read + delta);
+    layout->yellow = (uint32_t)((int64_t)layout->yellow + delta);
+    layout->yellow_copy = (uint32_t)((int64_t)layout->yellow_copy + delta);
+    layout->yellow_copy2 = (uint32_t)((int64_t)layout->yellow_copy2 + delta);
+    layout->yellow_combat = (uint32_t)((int64_t)layout->yellow_combat + delta);
+    layout->red = (uint32_t)((int64_t)layout->red + delta);
+    layout->blue = (uint32_t)((int64_t)layout->blue + delta);
+    layout->blue_cap = (uint32_t)((int64_t)layout->blue_cap + delta);
+    layout->health_max = (uint32_t)((int64_t)layout->health_max + delta);
+    layout->heartbeat = (uint32_t)((int64_t)layout->heartbeat + delta);
+    layout->name = "auto-shifted layout (experimental)";
+    return 1;
+}
+
+static int valid_shifted_layout(HANDLE proc, uintptr_t player, const Layout *layout)
+{
+    float display, copy, red, max;
+    return valid_layout(proc, player, layout) &&
+           rpm4f(proc, player + layout->yellow_read, &display) &&
+           rpm4f(proc, player + layout->yellow_read - 4, &copy) &&
+           rpm4f(proc, player + layout->red, &red) &&
+           rpm4f(proc, player + layout->health_max, &max) &&
+           isfinite(display) && display >= 0.0f && display <= 0.30f &&
+           isfinite(copy) && copy >= 0.0f && copy <= 0.30f &&
+           max >= 0.245f && max <= 0.255f && red <= max + 0.01f;
+}
+
 static int consider_match(HANDLE proc, uintptr_t base, uintptr_t end, uintptr_t at,
-                          uintptr_t *found_slot, const Layout **found_layout,
-                          ScanReport *report)
+                          int allow_shift, uintptr_t *found_slot,
+                          Layout *found_layout, ScanReport *report)
 {
     uint32_t field;
     if (!rpm(proc, at + 9, &field, sizeof(field))) return 0;
-    const Layout *layout = NULL;
-    for (size_t i = 0; i < sizeof(layouts) / sizeof(layouts[0]); i++)
-        if (layouts[i].yellow_read == field ||
-            layouts[i].yellow == field) { layout = &layouts[i]; break; }
-    if (!layout) return 0;
+    Layout candidates[2];
+    size_t count = 0;
+    if (allow_shift) {
+        if (shifted_layout(field, layouts[1].yellow_read, &candidates[count])) count++;
+        if (shifted_layout(field, layouts[1].yellow, &candidates[count])) count++;
+    } else {
+        for (size_t i = 0; i < sizeof(layouts) / sizeof(layouts[0]); i++)
+            if (layouts[i].yellow_read == field || layouts[i].yellow == field)
+                candidates[count++] = layouts[i];
+    }
+    if (!count) return 0;
     report->known_fields++;
 
     uintptr_t slot = pointer_slot(proc, at);
@@ -184,16 +239,21 @@ static int consider_match(HANDLE proc, uintptr_t base, uintptr_t end, uintptr_t 
     if (!slot || slot < base || slot >= end || end - slot < sizeof(player) ||
         !rpm8(proc, slot, &player) || !player) return 0;
     report->readable_players++;
-    if (!valid_layout(proc, (uintptr_t)player, layout)) return 0;
-    report->valid_players++;
-
-    if (*found_slot && (*found_slot != slot || *found_layout != layout)) return -1;
-    *found_slot = slot;
-    *found_layout = layout;
-    return 1;
+    for (size_t i = 0; i < count; i++) {
+        Layout *layout = &candidates[i];
+        if (!(allow_shift ? valid_shifted_layout(proc, (uintptr_t)player, layout)
+                          : valid_layout(proc, (uintptr_t)player, layout))) continue;
+        report->valid_players++;
+        if (*found_slot && (*found_slot != slot ||
+                            found_layout->yellow_read != layout->yellow_read)) return -1;
+        *found_slot = slot;
+        *found_layout = *layout;
+    }
+    return 0;
 }
 
-static int resolve_layout(HANDLE proc, uintptr_t base, ScanReport *report)
+static int resolve_layout_pass(HANDLE proc, uintptr_t base, ScanReport *report,
+                               int allow_shift)
 {
     /* Ignore address and field bytes that change between game builds. */
     static const uint8_t pat[] = {0x48,0x8B,0x05,0,0,0,0,0x8B,0x80,0,0,0,0};
@@ -201,7 +261,7 @@ static int resolve_layout(HANDLE proc, uintptr_t base, ScanReport *report)
     MEMORY_BASIC_INFORMATION mbi;
     uint8_t *buf = NULL; size_t cap = 0;
     uintptr_t addr = base, found_slot = 0;
-    const Layout *found_layout = NULL;
+    Layout found_layout = {0};
     memset(report, 0, sizeof(*report));
     MODULEINFO info;
     if (!GetModuleInformation(proc, (HMODULE)base, &info, sizeof(info)) ||
@@ -228,6 +288,7 @@ static int resolve_layout(HANDLE proc, uintptr_t base, ScanReport *report)
                         report->code_matches++;
                         if (consider_match(proc, base, end,
                                            (uintptr_t)mbi.BaseAddress + i,
+                                           allow_shift,
                                            &found_slot, &found_layout, report) < 0)
                             report->ambiguous = 1;
                     }
@@ -241,8 +302,24 @@ static int resolve_layout(HANDLE proc, uintptr_t base, ScanReport *report)
     free(buf);
     if (report->ambiguous || !found_slot) return 0;
     g_player_slot = found_slot - base;
-    g_layout = found_layout;
+    g_selected_layout = found_layout;
+    g_layout = &g_selected_layout;
+    g_auto_shifted = allow_shift;
     return 1;
+}
+
+static int resolve_layout(HANDLE proc, uintptr_t base, ScanReport *report)
+{
+#ifdef EXANIMA_FORCE_SHIFT_SCAN
+    return resolve_layout_pass(proc, base, report, 1);
+#else
+    if (resolve_layout_pass(proc, base, report, 0)) return 1;
+    if (report->ambiguous) return 0;
+    ScanReport known = *report;
+    if (resolve_layout_pass(proc, base, report, 1)) return 1;
+    if (known.known_fields) *report = known;
+    return 0;
+#endif
 }
 
 static uintptr_t get_player(HANDLE proc, uintptr_t base)
@@ -313,7 +390,7 @@ int main(void)
     if (!resolve_layout(proc, base, &scan)) {
         const char *reason = scan.ambiguous ? "More than one player matched." :
             !scan.code_matches ? "The game code no longer matches the scan." :
-            !scan.known_fields ? "The health offsets have moved." :
+            !scan.known_fields ? "The health layout has changed beyond a simple shift." :
             !scan.readable_players ? "The player pointer could not be read. Load a save first." :
             "The health values did not match a known layout.";
         char message[512];
@@ -325,6 +402,10 @@ int main(void)
     }
     printf("Player pointer: module+0x%llX; layout: %s\n",
            (unsigned long long)g_player_slot, g_layout->name);
+    if (g_auto_shifted)
+        printf("Auto-shifted offsets: yellow 0x%X, red 0x%X, blue 0x%X.\n"
+               "Might work, might not work - raise it in nexusmods if it doesn't plz\n",
+               g_layout->yellow, g_layout->red, g_layout->blue);
 
     uintptr_t player = get_player(proc, base);
     if (!player) return startup_error(proc, "Cannot read the player pointer. Load a save first.");
@@ -389,8 +470,14 @@ int main(void)
         if (MULTS[yel] != 0.0f) {
             float v = amplify(proc, player + g_layout->yellow, &old_yel, MULTS[yel], YEL_MAX);
             if (v >= 0.0f) {
-                if (g_layout->yellow_copy) wpm4f(proc, player + g_layout->yellow_copy, v);
-                if (g_layout->yellow_combat) wpm4f(proc, player + g_layout->yellow_combat, v);
+                if (g_layout->yellow_copy && g_layout->yellow_copy != g_layout->yellow)
+                    wpm4f(proc, player + g_layout->yellow_copy, v);
+                if (g_layout->yellow_copy2 && g_layout->yellow_copy2 != g_layout->yellow)
+                    wpm4f(proc, player + g_layout->yellow_copy2, v);
+                if (g_layout->yellow_combat && g_layout->yellow_combat != g_layout->yellow)
+                    wpm4f(proc, player + g_layout->yellow_combat, v);
+                if (MULTS[yel] == LOCK && g_layout->yellow_combat == g_layout->yellow)
+                    wpm4f(proc, player + g_layout->yellow_combat, YEL_MAX);
             }
         }
 
